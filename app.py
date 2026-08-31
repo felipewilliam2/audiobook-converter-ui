@@ -46,6 +46,8 @@ def pdf_to_epub(pdf_path: str, work_dir: str) -> str:
         capture_output=True,
         text=True,
         timeout=600,
+        cwd=work_dir,
+        env={**os.environ, "HOME": work_dir},
     )
     if result.returncode != 0 or not os.path.exists(epub_path):
         raise RuntimeError(
@@ -55,7 +57,7 @@ def pdf_to_epub(pdf_path: str, work_dir: str) -> str:
     return epub_path
 
 
-def run_tts(epub_path: str, out_dir: str, voice_name: str):
+def run_tts(epub_path: str, out_dir: str, voice_name: str, work_dir: str):
     os.makedirs(out_dir, exist_ok=True)
     result = subprocess.run(
         [
@@ -76,6 +78,11 @@ def run_tts(epub_path: str, out_dir: str, voice_name: str):
         capture_output=True,
         text=True,
         timeout=3600,
+        # main.py cria "logs/" relativo ao cwd. O WORKDIR da imagem base é
+        # /app (raiz, dono root) -- como rodamos como UID 1000 (ver
+        # deployment.yaml), não tem permissão de escrever lá. work_dir é a
+        # nossa própria pasta temporária, gravável.
+        cwd=work_dir,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -141,7 +148,7 @@ def converter(arquivo, titulo, autor, voz_label, progress=gr.Progress()):
 
             progress(0.3, desc="Gerando áudio (isso pode levar alguns minutos)...")
             out_dir = os.path.join(work_dir, "saida")
-            run_tts(epub_path, out_dir, voice_name)
+            run_tts(epub_path, out_dir, voice_name, work_dir)
 
             progress(0.9, desc="Organizando os arquivos na estante...")
             total = tag_and_move_chapters(out_dir, autor.strip(), titulo.strip())
