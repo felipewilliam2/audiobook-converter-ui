@@ -39,8 +39,15 @@ from mutagen.mp3 import MP3
 
 MAIN_PY = "/app_src/main.py"
 LIBRARY_ROOT = "/audiobooks"
-PDF_CONVERT_TIMEOUT = 600
-TTS_TIMEOUT = 3600
+PDF_CONVERT_TIMEOUT = 1200
+# Livros grandes de verdade passam de 1h fácil (860 mil caracteres, 104
+# capítulos, levou ~65min num teste real) -- a arquitetura em background
+# não tem mais motivo pra manter um timeout apertado tipo os 3600s
+# originais (isso era resquício do design síncrono antigo, onde um job
+# preso travava o navegador; agora só mostra "gerando áudio..." por mais
+# tempo, sem travar nada). Generoso, mas ainda finito pra evitar um job
+# realmente travado rodando pra sempre.
+TTS_TIMEOUT = 7200
 
 VOICES = {
     "Antônio (masculina)": "pt-BR-AntonioNeural",
@@ -230,17 +237,44 @@ def run_job(job_id: str, arquivo: str, titulo: str, autor: str, voz_label: str):
 
             JOBS[job_id]["pct"] = pct_start
             out_dir = os.path.join(work_dir, "saida")
-            run_tts(epub_path, out_dir, voice_name, work_dir, job_id, pct_start)
+
+            # Mesmo se a geração de áudio estourar o tempo limite ou falhar
+            # no meio de um livro grande, ainda tentamos salvar os
+            # capítulos que já converteram com sucesso até aquele ponto --
+            # descartar um livro inteiro (às vezes depois de mais de uma
+            # hora rodando) por causa de um timeout batendo perto do fim
+            # seria jogar fora trabalho real. Só propaga o erro se não
+            # sobrou nenhum capítulo pra salvar.
+            partial_reason = None
+            try:
+                run_tts(epub_path, out_dir, voice_name, work_dir, job_id, pct_start)
+            except subprocess.TimeoutExpired:
+                partial_reason = "a conversão demorou demais e foi interrompida"
+            except RuntimeError as exc:
+                partial_reason = str(exc)
+
+            has_output = os.path.isdir(out_dir) and any(
+                f.lower().endswith(".mp3") for f in os.listdir(out_dir)
+            )
+            if partial_reason and not has_output:
+                raise RuntimeError(partial_reason)
 
             JOBS[job_id]["pct"] = 95
             JOBS[job_id]["message"] = "⏳ Organizando os arquivos na estante..."
             total = tag_and_move_chapters(out_dir, autor.strip(), titulo.strip())
 
             JOBS[job_id]["pct"] = 100
-            JOBS[job_id]["message"] = (
-                f"✅ Pronto! **{titulo.strip()}** já está na sua estante "
-                f"({total} capítulo(s))."
-            )
+            if partial_reason:
+                JOBS[job_id]["message"] = (
+                    f"⚠️ Convertido parcialmente: {total} capítulo(s) de "
+                    f"**{titulo.strip()}** já estão na sua estante, mas a "
+                    f"conversão não terminou o livro inteiro ({partial_reason})."
+                )
+            else:
+                JOBS[job_id]["message"] = (
+                    f"✅ Pronto! **{titulo.strip()}** já está na sua estante "
+                    f"({total} capítulo(s))."
+                )
     except subprocess.TimeoutExpired:
         JOBS[job_id]["message"] = (
             "❌ A conversão demorou demais e foi cancelada. "
