@@ -3,12 +3,16 @@
 Feita para ser usada por alguém sem perfil técnico: só título, autor, arquivo
 e voz. Sem opções de TTS/idioma/engine expostas.
 
-A conversão roda numa thread em background e o navegador só faz polling do
-status (gr.Timer) em vez de segurar uma única requisição/SSE aberta do
-início ao fim -- necessário porque o Cloudflare Tunnel (planos free/pro)
-corta conexões longas em ~100s, e uma conversão real (Calibre + TTS) passa
-disso com frequência. Cada consulta de status é rápida e independente,
-então nunca esbarra nesse limite.
+A conversão roda numa thread em background; o navegador acompanha via
+polling com fetch() puro (JS embutido no HTML retornado, ver
+status_box_html) contra uma rota FastAPI própria (/job_status/<id>) --
+fora do sistema de fila/SSE do Gradio inteiramente. Necessário porque o
+Gradio atual entrega TODO evento (mesmo com queue=False) pela mesma
+conexão /queue/data (SSE) de longa duração da sessão, e o Cloudflare
+Tunnel (planos free/pro) corta ela em ~100s -- uma conversão real
+(Calibre + TTS) passa disso com frequência. Um fetch() comum não usa
+essa conexão, então o polling nunca esbarra nesse limite, não importa
+quanto tempo a conversão leve.
 """
 
 import os
@@ -21,6 +25,9 @@ import unicodedata
 import uuid
 
 import gradio as gr
+import uvicorn
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 from mutagen.mp3 import MP3
@@ -178,13 +185,47 @@ def run_job(job_id: str, arquivo: str, titulo: str, autor: str, voz_label: str):
         JOBS[job_id]["done"] = True
 
 
+def status_box_html(message: str, job_id: str | None = None) -> str:
+    """HTML estático + <script> que faz polling via fetch() puro em
+    /job_status/<id>, fora do sistema de fila/SSE do Gradio inteiramente.
+
+    Necessário porque, no Gradio atual, TODO evento (mesmo com
+    queue=False) é entregue pela mesma conexão /queue/data (SSE) de longa
+    duração que a sessão mantém -- e o Cloudflare Tunnel corta ela depois
+    de ~100s, não importa o quão pequenas sejam as mensagens que passam
+    por ali. Um fetch() comum não usa essa conexão, então nunca esbarra
+    nesse limite, não importa quanto tempo a conversão real leve.
+    """
+    box = f'<div id="status-box" style="font-size:1rem">{message}</div>'
+    if not job_id:
+        return box
+    script = f"""
+    <script>
+    (function() {{
+        var jobId = {job_id!r};
+        var box = document.getElementById("status-box");
+        var iv = setInterval(function() {{
+            fetch("/job_status/" + jobId)
+                .then(function(r) {{ return r.json(); }})
+                .then(function(data) {{
+                    box.innerHTML = data.message;
+                    if (data.done) clearInterval(iv);
+                }})
+                .catch(function() {{}});
+        }}, 3000);
+    }})();
+    </script>
+    """
+    return box + script
+
+
 def iniciar_conversao(arquivo, titulo, autor, voz_label):
     if arquivo is None:
-        return None, "⚠️ Escolha um arquivo EPUB ou PDF primeiro.", gr.Timer(active=False)
+        return status_box_html("⚠️ Escolha um arquivo EPUB ou PDF primeiro.")
     if not titulo.strip() or not autor.strip():
-        return None, "⚠️ Preencha o título e o autor do livro.", gr.Timer(active=False)
+        return status_box_html("⚠️ Preencha o título e o autor do livro.")
     if os.path.splitext(arquivo)[1].lower() not in (".epub", ".pdf"):
-        return None, "⚠️ Só aceito arquivos .epub ou .pdf.", gr.Timer(active=False)
+        return status_box_html("⚠️ Só aceito arquivos .epub ou .pdf.")
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {"message": "⏳ Iniciando...", "done": False}
@@ -193,14 +234,7 @@ def iniciar_conversao(arquivo, titulo, autor, voz_label):
         args=(job_id, arquivo, titulo, autor, voz_label),
         daemon=True,
     ).start()
-    return job_id, JOBS[job_id]["message"], gr.Timer(active=True)
-
-
-def checar_status(job_id):
-    if not job_id or job_id not in JOBS:
-        return "", gr.Timer(active=False)
-    job = JOBS[job_id]
-    return job["message"], gr.Timer(active=not job["done"])
+    return status_box_html(JOBS[job_id]["message"], job_id)
 
 
 with gr.Blocks(title="Conversor de Audiolivros") as demo:
@@ -211,9 +245,6 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
     )
     gr.Markdown(f"ℹ️ {PDF_WARNING}")
 
-    job_id_state = gr.State(None)
-    timer = gr.Timer(3, active=False)
-
     with gr.Row():
         with gr.Column():
             arquivo = gr.File(label="Livro (EPUB ou PDF)", file_types=[".epub", ".pdf"], type="filepath")
@@ -222,27 +253,34 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
             voz = gr.Dropdown(label="Voz", choices=list(VOICES.keys()), value=list(VOICES.keys())[0])
             botao = gr.Button("Converter", variant="primary")
         with gr.Column():
-            resultado = gr.Markdown(label="Status")
+            resultado = gr.HTML(status_box_html(""), label="Status")
 
-    # queue=False é essencial aqui: sem isso, mesmo esses eventos rápidos
-    # continuam sendo entregues pela mesma conexão /queue/data (SSE) de
-    # longa duração que o Gradio mantém por padrão para toda a sessão --
-    # e o Cloudflare Tunnel corta ela do mesmo jeito depois de ~100s,
-    # mesmo carregando só ticks pequenos em vez do trabalho pesado. Com
-    # queue=False, cada clique/tick vira uma requisição HTTP direta e
-    # independente, sem nenhuma conexão de longa duração envolvida.
+    # queue=False aqui só evita o clique entrar na fila do Gradio atrás de
+    # outros eventos -- não tira a chamada da conexão /queue/data (isso não
+    # é mais possível no Gradio atual, ver status_box_html acima). Mas
+    # essa chamada é rápida (só dispara a thread e retorna), então não é
+    # ela que fica presa no limite de duração do Cloudflare -- o polling
+    # via fetch() embutido no HTML retornado é quem faz o trabalho pesado
+    # de acompanhar a conversão inteira, e esse sim é imune ao limite.
     botao.click(
         fn=iniciar_conversao,
         inputs=[arquivo, titulo, autor, voz],
-        outputs=[job_id_state, resultado, timer],
-        queue=False,
-    )
-    timer.tick(
-        fn=checar_status,
-        inputs=[job_id_state],
-        outputs=[resultado, timer],
+        outputs=[resultado],
         queue=False,
     )
 
+fastapi_app = FastAPI()
+
+
+@fastapi_app.get("/job_status/{job_id}")
+def job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        return JSONResponse({"message": "", "done": True})
+    return JSONResponse({"message": job["message"], "done": job["done"]})
+
+
+app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+
 if __name__ == "__main__":
-    demo.queue().launch(server_name="0.0.0.0", server_port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
