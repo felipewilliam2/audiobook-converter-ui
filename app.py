@@ -224,12 +224,25 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
         with gr.Column():
             resultado = gr.Markdown(label="Status")
 
+    # queue=False é essencial aqui: sem isso, mesmo esses eventos rápidos
+    # continuam sendo entregues pela mesma conexão /queue/data (SSE) de
+    # longa duração que o Gradio mantém por padrão para toda a sessão --
+    # e o Cloudflare Tunnel corta ela do mesmo jeito depois de ~100s,
+    # mesmo carregando só ticks pequenos em vez do trabalho pesado. Com
+    # queue=False, cada clique/tick vira uma requisição HTTP direta e
+    # independente, sem nenhuma conexão de longa duração envolvida.
     botao.click(
         fn=iniciar_conversao,
         inputs=[arquivo, titulo, autor, voz],
         outputs=[job_id_state, resultado, timer],
+        queue=False,
     )
-    timer.tick(fn=checar_status, inputs=[job_id_state], outputs=[resultado, timer])
+    timer.tick(
+        fn=checar_status,
+        inputs=[job_id_state],
+        outputs=[resultado, timer],
+        queue=False,
+    )
 
 if __name__ == "__main__":
     demo.queue().launch(server_name="0.0.0.0", server_port=7860)
