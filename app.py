@@ -185,47 +185,46 @@ def run_job(job_id: str, arquivo: str, titulo: str, autor: str, voz_label: str):
         JOBS[job_id]["done"] = True
 
 
-def status_box_html(message: str, job_id: str | None = None) -> str:
-    """HTML estático + <script> que faz polling via fetch() puro em
-    /job_status/<id>, fora do sistema de fila/SSE do Gradio inteiramente.
+# JS que efetivamente inicia o polling -- roda como função de verdade
+# (evento js= do Gradio), não como <script> injetado via innerHTML, que os
+# navegadores simplesmente ignoram (é assim que HTML.innerHTML sempre
+# funcionou -- proteção padrão contra XSS, não é bug do Gradio). Recebe o
+# job_id retornado pela função Python anterior e, se não for vazio, começa
+# a consultar /job_status/<id> a cada 3s via fetch() puro, direto no DOM,
+# sem passar pelo sistema de componentes/fila do Gradio de forma alguma.
+POLL_JS = """
+(job_id) => {
+    if (!job_id) return;
+    const box = document.getElementById("status-box");
+    const iv = setInterval(() => {
+        fetch("/job_status/" + job_id)
+            .then((r) => r.json())
+            .then((data) => {
+                if (box) box.innerHTML = data.message;
+                if (data.done) clearInterval(iv);
+            })
+            .catch(() => {});
+    }, 3000);
+}
+"""
 
-    Necessário porque, no Gradio atual, TODO evento (mesmo com
-    queue=False) é entregue pela mesma conexão /queue/data (SSE) de longa
-    duração que a sessão mantém -- e o Cloudflare Tunnel corta ela depois
-    de ~100s, não importa o quão pequenas sejam as mensagens que passam
-    por ali. Um fetch() comum não usa essa conexão, então nunca esbarra
-    nesse limite, não importa quanto tempo a conversão real leve.
-    """
-    box = f'<div id="status-box" style="font-size:1rem">{message}</div>'
-    if not job_id:
-        return box
-    script = f"""
-    <script>
-    (function() {{
-        var jobId = {job_id!r};
-        var box = document.getElementById("status-box");
-        var iv = setInterval(function() {{
-            fetch("/job_status/" + jobId)
-                .then(function(r) {{ return r.json(); }})
-                .then(function(data) {{
-                    box.innerHTML = data.message;
-                    if (data.done) clearInterval(iv);
-                }})
-                .catch(function() {{}});
-        }}, 3000);
-    }})();
-    </script>
-    """
-    return box + script
+
+def status_box(message: str) -> str:
+    # A div com este id precisa existir sempre que o Gradio atualiza o
+    # componente "resultado" (ver botao.click abaixo) -- senão POLL_JS
+    # perde a referência via getElementById na próxima atualização via
+    # fetch() e o polling continua rodando, mas silenciosamente sem
+    # aparecer na tela.
+    return f'<div id="status-box">{message}</div>'
 
 
 def iniciar_conversao(arquivo, titulo, autor, voz_label):
     if arquivo is None:
-        return status_box_html("⚠️ Escolha um arquivo EPUB ou PDF primeiro.")
+        return status_box("⚠️ Escolha um arquivo EPUB ou PDF primeiro."), ""
     if not titulo.strip() or not autor.strip():
-        return status_box_html("⚠️ Preencha o título e o autor do livro.")
+        return status_box("⚠️ Preencha o título e o autor do livro."), ""
     if os.path.splitext(arquivo)[1].lower() not in (".epub", ".pdf"):
-        return status_box_html("⚠️ Só aceito arquivos .epub ou .pdf.")
+        return status_box("⚠️ Só aceito arquivos .epub ou .pdf."), ""
 
     job_id = str(uuid.uuid4())
     JOBS[job_id] = {"message": "⏳ Iniciando...", "done": False}
@@ -234,7 +233,7 @@ def iniciar_conversao(arquivo, titulo, autor, voz_label):
         args=(job_id, arquivo, titulo, autor, voz_label),
         daemon=True,
     ).start()
-    return status_box_html(JOBS[job_id]["message"], job_id)
+    return status_box(JOBS[job_id]["message"]), job_id
 
 
 with gr.Blocks(title="Conversor de Audiolivros") as demo:
@@ -253,20 +252,26 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
             voz = gr.Dropdown(label="Voz", choices=list(VOICES.keys()), value=list(VOICES.keys())[0])
             botao = gr.Button("Converter", variant="primary")
         with gr.Column():
-            resultado = gr.HTML(status_box_html(""), label="Status")
+            resultado = gr.HTML(status_box(""), label="Status")
+            job_id_box = gr.Textbox(visible=False)
 
-    # queue=False aqui só evita o clique entrar na fila do Gradio atrás de
-    # outros eventos -- não tira a chamada da conexão /queue/data (isso não
-    # é mais possível no Gradio atual, ver status_box_html acima). Mas
-    # essa chamada é rápida (só dispara a thread e retorna), então não é
-    # ela que fica presa no limite de duração do Cloudflare -- o polling
-    # via fetch() embutido no HTML retornado é quem faz o trabalho pesado
-    # de acompanhar a conversão inteira, e esse sim é imune ao limite.
+    # queue=False evita que este clique entre na fila do Gradio atrás de
+    # outros eventos -- não tira a chamada da conexão /queue/data em si
+    # (não é mais possível desabilitar isso por completo no Gradio atual),
+    # mas essa chamada só dispara a thread e retorna na hora, então nunca
+    # fica presa tempo suficiente pra importar. Quem acompanha a conversão
+    # inteira é o .then() seguinte, via JS real (POLL_JS) chamando
+    # /job_status/<id> por fetch() puro -- nunca passa pelo Gradio.
     botao.click(
         fn=iniciar_conversao,
         inputs=[arquivo, titulo, autor, voz],
-        outputs=[resultado],
+        outputs=[resultado, job_id_box],
         queue=False,
+    ).then(
+        fn=None,
+        inputs=[job_id_box],
+        outputs=None,
+        js=POLL_JS,
     )
 
 fastapi_app = FastAPI()
