@@ -2,6 +2,13 @@
 
 Feita para ser usada por alguém sem perfil técnico: só título, autor, arquivo
 e voz. Sem opções de TTS/idioma/engine expostas.
+
+A conversão roda numa thread em background e o navegador só faz polling do
+status (gr.Timer) em vez de segurar uma única requisição/SSE aberta do
+início ao fim -- necessário porque o Cloudflare Tunnel (planos free/pro)
+corta conexões longas em ~100s, e uma conversão real (Calibre + TTS) passa
+disso com frequência. Cada consulta de status é rápida e independente,
+então nunca esbarra nesse limite.
 """
 
 import os
@@ -9,7 +16,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import unicodedata
+import uuid
 
 import gradio as gr
 from mutagen.easyid3 import EasyID3
@@ -29,6 +38,11 @@ PDF_WARNING = (
     "PDFs digitalizados ou com colunas duplas podem sair com erros ou em "
     "ordem errada — quando disponível, prefira o EPUB."
 )
+
+# job_id -> {"message": str, "done": bool}. Em memória, processo único --
+# suficiente para o uso doméstico deste app (não sobrevive a um restart do
+# pod, mas o job também não sobreviveria mesmo com persistência).
+JOBS: dict[str, dict] = {}
 
 
 def sanitize_path_component(value: str) -> str:
@@ -126,44 +140,67 @@ def tag_and_move_chapters(out_dir: str, autor: str, titulo: str) -> int:
     return len(mp3_files)
 
 
-def converter(arquivo, titulo, autor, voz_label, progress=gr.Progress()):
-    if arquivo is None:
-        return "⚠️ Escolha um arquivo EPUB ou PDF primeiro."
-    if not titulo.strip() or not autor.strip():
-        return "⚠️ Preencha o título e o autor do livro."
-
+def run_job(job_id: str, arquivo: str, titulo: str, autor: str, voz_label: str):
     voice_name = VOICES.get(voz_label, next(iter(VOICES.values())))
     ext = os.path.splitext(arquivo)[1].lower()
 
-    if ext not in (".epub", ".pdf"):
-        return "⚠️ Só aceito arquivos .epub ou .pdf."
-
-    with tempfile.TemporaryDirectory() as work_dir:
-        try:
+    try:
+        with tempfile.TemporaryDirectory() as work_dir:
             if ext == ".pdf":
-                progress(0.1, desc="Convertendo PDF para EPUB...")
+                JOBS[job_id]["message"] = "⏳ Convertendo PDF para EPUB..."
                 epub_path = pdf_to_epub(arquivo, work_dir)
             else:
                 epub_path = arquivo
 
-            progress(0.3, desc="Gerando áudio (isso pode levar alguns minutos)...")
+            JOBS[job_id]["message"] = (
+                "⏳ Gerando áudio (isso pode levar alguns minutos)..."
+            )
             out_dir = os.path.join(work_dir, "saida")
             run_tts(epub_path, out_dir, voice_name, work_dir)
 
-            progress(0.9, desc="Organizando os arquivos na estante...")
+            JOBS[job_id]["message"] = "⏳ Organizando os arquivos na estante..."
             total = tag_and_move_chapters(out_dir, autor.strip(), titulo.strip())
 
-            progress(1.0, desc="Pronto!")
-            return (
+            JOBS[job_id]["message"] = (
                 f"✅ Pronto! **{titulo.strip()}** já está na sua estante "
                 f"({total} capítulo(s))."
             )
-        except subprocess.TimeoutExpired:
-            return "❌ A conversão demorou demais e foi cancelada. Tente um livro menor ou tente de novo."
-        except RuntimeError as exc:
-            return f"❌ {exc}"
-        except Exception as exc:  # noqa: BLE001 - mostrar qualquer falha inesperada pra quem vai debugar
-            return f"❌ Algo deu errado: {exc}"
+    except subprocess.TimeoutExpired:
+        JOBS[job_id]["message"] = (
+            "❌ A conversão demorou demais e foi cancelada. "
+            "Tente um livro menor ou tente de novo."
+        )
+    except RuntimeError as exc:
+        JOBS[job_id]["message"] = f"❌ {exc}"
+    except Exception as exc:  # noqa: BLE001 - mostrar qualquer falha inesperada pra quem vai debugar
+        JOBS[job_id]["message"] = f"❌ Algo deu errado: {exc}"
+    finally:
+        JOBS[job_id]["done"] = True
+
+
+def iniciar_conversao(arquivo, titulo, autor, voz_label):
+    if arquivo is None:
+        return None, "⚠️ Escolha um arquivo EPUB ou PDF primeiro.", gr.Timer(active=False)
+    if not titulo.strip() or not autor.strip():
+        return None, "⚠️ Preencha o título e o autor do livro.", gr.Timer(active=False)
+    if os.path.splitext(arquivo)[1].lower() not in (".epub", ".pdf"):
+        return None, "⚠️ Só aceito arquivos .epub ou .pdf.", gr.Timer(active=False)
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"message": "⏳ Iniciando...", "done": False}
+    threading.Thread(
+        target=run_job,
+        args=(job_id, arquivo, titulo, autor, voz_label),
+        daemon=True,
+    ).start()
+    return job_id, JOBS[job_id]["message"], gr.Timer(active=True)
+
+
+def checar_status(job_id):
+    if not job_id or job_id not in JOBS:
+        return "", gr.Timer(active=False)
+    job = JOBS[job_id]
+    return job["message"], gr.Timer(active=not job["done"])
 
 
 with gr.Blocks(title="Conversor de Audiolivros") as demo:
@@ -173,6 +210,9 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
         "Quando terminar, ele já aparece na sua estante do Audiobookshelf."
     )
     gr.Markdown(f"ℹ️ {PDF_WARNING}")
+
+    job_id_state = gr.State(None)
+    timer = gr.Timer(3, active=False)
 
     with gr.Row():
         with gr.Column():
@@ -184,7 +224,12 @@ with gr.Blocks(title="Conversor de Audiolivros") as demo:
         with gr.Column():
             resultado = gr.Markdown(label="Status")
 
-    botao.click(fn=converter, inputs=[arquivo, titulo, autor, voz], outputs=resultado)
+    botao.click(
+        fn=iniciar_conversao,
+        inputs=[arquivo, titulo, autor, voz],
+        outputs=[job_id_state, resultado, timer],
+    )
+    timer.tick(fn=checar_status, inputs=[job_id_state], outputs=[resultado, timer])
 
 if __name__ == "__main__":
     demo.queue().launch(server_name="0.0.0.0", server_port=7860)
